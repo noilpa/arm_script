@@ -1,26 +1,17 @@
 package values
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v2"
 )
-
-type Values struct {
-	NodeSelector map[string]string `yaml:"nodeSelector,omitempty"`
-	Tolerations  []Toleration      `yaml:"tolerations,omitempty"`
-}
-
-type Toleration struct {
-	Key      string `yaml:"key"`
-	Operator string `yaml:"operator"`
-	Value    string `yaml:"value"`
-	Effect   string `yaml:"effect"`
-}
 
 func Update(ctx context.Context, root string) ([]string, error) {
 	log.Printf("Update Values in %s\n", root)
@@ -70,68 +61,90 @@ func Update(ctx context.Context, root string) ([]string, error) {
 	return modifiedFiles, nil
 }
 
+// Структура для хранения данных из YAML
+type YamlData map[string]interface{}
+
 // checkAndAddFields проверяет и добавляет необходимые строки в файл values.yaml.
 func checkAndAddFields(filePath string) (bool, error) {
-	file, err := os.Open(filePath)
+	// Чтение содержимого файла
+	fileData, err := os.ReadFile(filePath)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to read file: %v", err)
 	}
-	defer file.Close()
 
-	// Флаги, указывающие на наличие нужных строк в файле.
-	nodeSelectorExists := false
-	tolerationExists := false
+	// Парсинг YAML
+	var yamlContent YamlData
+	err = yaml.Unmarshal(fileData, &yamlContent)
+	if err != nil {
+		return false, fmt.Errorf("failed to unmarshal yaml: %v", err)
+	}
 
-	// Проверяем, есть ли нужные строки в файле.
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "nodeSelector:") {
-			nodeSelectorExists = true
+	// Флаг изменений
+	changed := false
+
+	// Проверка и добавление nodeSelector
+	if _, ok := yamlContent["nodeSelector"]; !ok {
+		yamlContent["nodeSelector"] = map[string]string{
+			"dedicated-to": "multi-arch",
 		}
-		if strings.Contains(line, "tolerations") {
-			tolerationExists = true
+		changed = true
+	}
+
+	// Проверка и добавление tolerations
+	if _, ok := yamlContent["tolerations"]; !ok {
+		yamlContent["tolerations"] = []map[string]string{
+			{
+				"key":      "dedicated-to",
+				"operator": "Equal",
+				"value":    "multi-arch",
+				"effect":   "NoSchedule",
+			},
+		}
+		changed = true
+	}
+
+	// Проверка и модификация секции mysqlMigrations
+	if mysqlMigrations, ok := yamlContent["mysqlMigrations"].(map[interface{}]interface{}); ok {
+		if _, ok := mysqlMigrations["image"]; !ok {
+			mysqlMigrations["image"] = "registry.idmp.tech/infra/liquibase-toolkit:0a626acd"
+			changed = true
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return false, err
-	}
-
-	// Если обе строки уже присутствуют, файл не изменяется.
-	if nodeSelectorExists && tolerationExists {
+	// Если изменений не было, возвращаем false
+	if !changed {
 		return false, nil
 	}
 
-	// Открываем файл для добавления.
-	file, err = os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
+	// Сортировка корневых ключей для упорядоченного вывода
+	keys := make([]string, 0, len(yamlContent))
+	for k := range yamlContent {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Ручная сериализация каждого ключа с добавлением пустых строк между секциями
+	var buffer bytes.Buffer
+	for i, key := range keys {
+		if i > 0 {
+			buffer.WriteString("\n") // Добавляем пустую строку между секциями
+		}
+
+		// Сериализация каждого ключа отдельно
+		sectionData := map[string]interface{}{key: yamlContent[key]}
+		sectionYaml, err := yaml.Marshal(sectionData)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal yaml section for key %s: %v", key, err)
+		}
+		buffer.Write(sectionYaml)
+	}
+
+	// Запись обновленных данных обратно в файл
+	err = os.WriteFile(filePath, buffer.Bytes(), 0644)
 	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-
-	// Построение строк для добавления.
-	var builder strings.Builder
-
-	// Добавляем nodeSelector, если его нет.
-	if !nodeSelectorExists {
-		builder.WriteString("\nnodeSelector:\n  dedicated-to: multi-arch\n")
+		return false, fmt.Errorf("failed to write updated yaml to file: %v", err)
 	}
 
-	// Добавляем tolerations, если его нет.
-	if !tolerationExists {
-		builder.WriteString("tolerations:\n")
-		builder.WriteString("  - key: dedicated-to\n")
-		builder.WriteString("    operator: Equal\n")
-		builder.WriteString("    value: multi-arch\n")
-		builder.WriteString("    effect: NoSchedule\n")
-	}
-
-	// Записываем строки в конец файла.
-	_, err = file.WriteString(builder.String())
-	if err != nil {
-		return false, err
-	}
-
+	// Возвращаем true, так как были изменения
 	return true, nil
 }
